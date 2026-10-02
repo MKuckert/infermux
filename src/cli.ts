@@ -24,7 +24,7 @@ Environment:
 );
 }
 
-function parseArgs(argv: string[]): { configPath?: string; logLevel?: string } {
+export function parseArgs(argv: string[]): { configPath?: string; logLevel?: string } {
   const out: { configPath?: string; logLevel?: string } = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
