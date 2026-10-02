@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/infermux/infermux/main/config.schema.json",
+  "title": "infermux configuration",
+  "description": "Configuration for the infermux OpenAI-compatible inference proxy.",
+  "type": "object",
+  "required": ["models"],
+  "additionalProperties": false,
+  "properties": {
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Host/interface to bind (default 0.0.0.0)."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Port to listen on (default 8080). 0 = ephemeral."
+        },
+        "apiToken": {
+          "type": "string",
+          "description": "Bearer token required on /v1/*. Empty or omitted = auth disabled."
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requestTimeoutMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Per-request deadline in ms (queue + switch + upstream). Default 120000."
+        },
+        "healthCheckIntervalMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Health poll interval in ms. Default 500."
+        },
+        "healthCheckTimeoutMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Total health polling time in ms before giving up. Default 30000."
+        },
+        "coolDownMs": {
+          "type": "number",
+          "minimum": 0,
+          "description": "GPU cool-down buffer after stopping an engine, in ms. Default 3000."
+        },
+        "vramThresholdPct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "VRAM must drop below this fraction (0..1) before a start; 0 disables the gate. Default 0.15."
+        },
+        "vramBackend": {
+          "enum": ["auto", "none", "nvidia-smi", "rocm-smi", "amd-smi", "macos"],
+          "description": "VRAM source: auto-detect, no-op, or a specific backend. Default auto."
+        },
+        "vramCheckTimeoutMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Max time to keep polling VRAM usage in ms. Default 30000."
+        },
+        "vramCheckIntervalMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "VRAM poll interval in ms. Default 500."
+        },
+        "childKillGraceMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "SIGTERM -> SIGKILL grace period for child processes, in ms. Default 5000."
+        },
+        "stopCommandTimeoutMs": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Max time to wait for a shell stopCommand, in ms. Default 10000."
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Model alias -> engine configuration.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["provider", "targetBaseUrl"],
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Provider name; models sharing a provider share one engine instance."
+          },
+          "targetBaseUrl": {
+            "type": "string",
+            "pattern": "^https?://",
+            "description": "Base URL of the provider's OpenAI-compatible API (http:// or https://)."
+          },
+          "targetModel": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Model id expected by the provider; the request's model field is rewritten to this."
+          },
+          "startCommand": {
+            "type": "string",
+            "description": "Shell command that starts the engine (spawned by the proxy)."
+          },
+          "stopCommand": {
+            "type": "string",
+            "description": "Shell command that stops the engine."
+          },
+          "coolDownMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Per-model cool-down override, in ms."
+          },
+          "healthEndpoint": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Readiness endpoint path (relative to targetBaseUrl) that must return 200."
+          },
+          "vramThresholdPct": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Per-model VRAM threshold override (0..1)."
+          },
+          "managed": {
+            "type": "boolean",
+            "description": "false = engine runs on another host; proxy only health-checks and forwards."
+          },
+          "targetApiKey": {
+            "type": "string",
+            "description": "Provider API key sent as Authorization: Bearer. Supports ${ENV_VAR} expansion."
+          },
+          "targetHeaders": {
+            "type": "object",
+            "propertyNames": { "minLength": 1 },
+            "additionalProperties": { "type": "string" },
+            "description": "Static headers added to upstream requests (e.g. x-api-key). Values support ${ENV_VAR} expansion."
+          },
+          "metrics": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Non-standard provider metrics mapping for /v1/stats.",
+            "properties": {
+              "endpoint": {
+                "type": "string",
+                "pattern": "^/",
+                "description": "Endpoint path (relative to targetBaseUrl) to GET for stats."
+              },
+              "vramUsedMiB": {
+                "type": "string",
+                "description": "Dot-separated path into the JSON response for VRAM usage (MiB)."
+              },
+              "vramTotalMiB": {
+                "type": "string",
+                "description": "Dot-separated path into the JSON response for VRAM total (MiB)."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
