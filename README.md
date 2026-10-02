@@ -93,7 +93,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
       "provider": "mlx",
       "targetBaseUrl": "http://192.168.1.50:8080",
       "managed": false,
-      "healthEndpoint": "/health"
+      "healthEndpoint": "/health",
+      "targetApiKey": "${REMOTE_KEY}",        // env-expanded, sent as Authorization: Bearer
+      "targetHeaders": { "x-api-key": "${LITELLM_KEY}" }   // for non-OpenAI auth schemes
     }
   }
 }
@@ -115,6 +117,18 @@ runs on your laptop/server, in Docker, …):
 
 Mixing is fine: managed (local) and unmanaged (remote) models can coexist; the
 single-concurrency queue and engine-switching rules apply to all of them.
+
+### Target (provider) API tokens
+
+- **`targetApiKey`** — sent to the provider as `Authorization: Bearer <key>`
+  on every forwarded request. The client's own `Authorization` header is never
+  forwarded, so the proxy's `apiToken` and the provider key stay separate.
+- **`targetHeaders`** — arbitrary static headers for non-OpenAI auth schemes
+  (e.g. `"x-api-key"` for LiteLLM/Anthropic-style providers). A `targetApiKey`
+  takes precedence over an `authorization` entry in `targetHeaders`.
+- **`${ENV_VAR}` expansion** — both fields expand environment variables at load
+  time, keeping secrets out of the config file. An unset variable is a startup
+  error (with the variable named), not a silent bad-auth at request time.
 
 ### Key semantics
 

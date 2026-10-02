@@ -41,6 +41,11 @@
       "provider": "vllm",
       "targetBaseUrl": "http://127.0.0.1:8000",
       "targetModel": "Mistral-7B-Instruct-v0.2",
+      // Upstream auth: sent as `Authorization: Bearer <key>`; ${ENV} refs are
+      // expanded at load time (unset env vars fail startup, not first request).
+      // "targetApiKey": "${MY_PROVIDER_KEY}",
+      // Non-OpenAI auth schemes via static headers (take a ${ENV} ref too).
+      // "targetHeaders": { "x-api-key": "${LITELLM_KEY}" },
       "startCommand": "vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000",
       "stopCommand": "pkill -f 'vllm serve'",
       "coolDownMs": 5000,

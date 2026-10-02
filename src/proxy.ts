@@ -197,6 +197,11 @@ export function buildApp(deps: ProxyDeps): Hono {
         const headers: Record<string, string> = {
           "content-type": "application/json",
         };
+        // Static provider headers (x-api-key etc.); targetApiKey, if set,
+        // wins over a user-provided authorization entry.
+        for (const [hk, hv] of Object.entries(cfg.targetHeaders ?? {})) {
+          headers[hk] = hv;
+        }
         if (cfg.targetApiKey) headers.authorization = `Bearer ${cfg.targetApiKey}`;
 
         let upstream: Response;

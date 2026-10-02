@@ -94,8 +94,19 @@ export interface ModelConfig {
    * forwarding. Default: `true` (engine lives on the proxy host).
    */
   managed?: boolean;
-  /** Optional provider API key forwarded to the target endpoint. */
+  /**
+   * Optional provider API key forwarded to the target endpoint as
+   * `Authorization: Bearer <key>`. Supports `${ENV_VAR}` expansion so secrets
+   * need not live in the config file (unset vars are a load-time error).
+   */
   targetApiKey?: string;
+  /**
+   * Optional static headers added to every upstream request, for providers
+   * with non-OpenAI auth (e.g. `{ "x-api-key": "${LITELLM_KEY}" }`).
+   * Values support `${ENV_VAR}` expansion; a `targetApiKey` (if set) takes
+   * precedence over a `authorization` entry here.
+   */
+  targetHeaders?: Record<string, string>;
   /** Optional non-standard metrics mapping for the stats endpoint. */
   metrics?: MetricsMapping;
 }
@@ -125,6 +136,21 @@ export class ConfigError extends Error {
     super(message);
     this.name = "ConfigError";
   }
+}
+
+/**
+ * Expand `${ENV_VAR}` references from the environment. An unset variable is a
+ * load-time config error — a literal `${MISSING}` silently sent to the
+ * provider would be an opaque auth failure at request time.
+ */
+function expandEnv(value: string, ctx: string): string {
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (whole, name: string) => {
+    const v = process.env[name];
+    if (v === undefined) {
+      throw new ConfigError(`${ctx}: environment variable ${name} is not set (referenced as ${whole})`);
+    }
+    return v;
+  });
 }
 
 /** Strip // and /* *\/ comments from a JSON document (string/comment-aware). */
@@ -294,7 +320,19 @@ export function validateConfig(
       m.vramThresholdPct = vt;
     }
     const key = pickStr(entry, "targetApiKey");
-    if (key !== undefined) m.targetApiKey = key;
+    if (key !== undefined) {
+      m.targetApiKey = expandEnv(key, `${fileName}: models["${alias}"].targetApiKey`);
+    }
+    if (isObj(entry.targetHeaders)) {
+      const headers: Record<string, string> = {};
+      for (const [hk, hv] of Object.entries(entry.targetHeaders)) {
+        if (typeof hv !== "string" || !hk.trim()) {
+          throw new ConfigError(`${fileName}: models["${alias}"].targetHeaders must map strings to strings`);
+        }
+        headers[hk] = expandEnv(hv, `${fileName}: models["${alias}"].targetHeaders["${hk}"]`);
+      }
+      m.targetHeaders = headers;
+    }
     if (typeof entry.managed === "boolean") m.managed = entry.managed;
     if (isObj(entry.metrics)) {
       const metrics: MetricsMapping = {};

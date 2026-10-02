@@ -43,6 +43,9 @@ function createMockProvider(port: number) {
         model: body.model,
         choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }],
         usage: { prompt_tokens: 5, completion_tokens: 4, total_tokens: 9 },
+        // Echo what the provider saw, for auth-forwarding assertions.
+        __seenAuth: c.req.header("authorization") ?? null,
+        __seenHeader: c.req.header("x-api-key") ?? null,
       });
     }
     // SSE stream: 3 delta chunks + [DONE]
@@ -316,5 +319,20 @@ describe("infermux end-to-end", () => {
     expect(json.activeEngine.running).toBe(true);
     expect(json.queue.length).toBe(0);
     expect(json.tokensPerSec.average).not.toBeNull();
+  });
+
+  it("forwards targetApiKey as Bearer and merges targetHeaders upstream", async () => {
+    // Mutate at the end: the proxy reads model config per request.
+    config.models.llama.targetApiKey = "upstream-secret";
+    config.models.llama.targetHeaders = { "x-api-key": "hk-1" };
+    const res = await fetch(url("/v1/chat/completions"), {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ model: "llama", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { __seenAuth: string | null; __seenHeader: string | null };
+    expect(json.__seenAuth).toBe("Bearer upstream-secret");
+    expect(json.__seenHeader).toBe("hk-1");
   });
 });

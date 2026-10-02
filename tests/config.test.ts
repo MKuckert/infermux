@@ -103,6 +103,44 @@ describe("validateConfig", () => {
     expect(cfg.models.m!.managed).toBe(false);
     expect(validateConfig(base).models.m1!.managed).toBeUndefined();
   });
+
+  it("expands ${ENV} in targetApiKey and targetHeaders", () => {
+    process.env.INFERMUX_TEST_KEY = "s3cret";
+    const cfg = validateConfig({
+      ...base,
+      models: {
+        m: {
+          provider: "p",
+          targetBaseUrl: "http://x",
+          targetApiKey: "${INFERMUX_TEST_KEY}",
+          targetHeaders: { "x-api-key": "prefix-${INFERMUX_TEST_KEY}", "x-static": "plain" },
+        },
+      },
+    });
+    expect(cfg.models.m!.targetApiKey).toBe("s3cret");
+    expect(cfg.models.m!.targetHeaders!["x-api-key"]).toBe("prefix-s3cret");
+    expect(cfg.models.m!.targetHeaders!["x-static"]).toBe("plain");
+    delete process.env.INFERMUX_TEST_KEY;
+  });
+
+  it("fails to load when a referenced env var is unset", () => {
+    delete process.env.INFERMUX_UNSET_KEY_XYZ;
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: { m: { provider: "p", targetBaseUrl: "http://x", targetApiKey: "${INFERMUX_UNSET_KEY_XYZ}" } },
+      }),
+    ).toThrow(/INFERMUX_UNSET_KEY_XYZ/);
+  });
+
+  it("rejects non-string targetHeaders values", () => {
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: { m: { provider: "p", targetBaseUrl: "http://x", targetHeaders: { "x": 5 } } as never },
+      }),
+    ).toThrow(/targetHeaders/);
+  });
 });
 
 describe("loadConfigFile", () => {
