@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import Ajv2020 from "ajv/dist/2020.js";
 import { validateConfig, stripJsonComments, loadConfigFile, ConfigError } from "../src/config.js";
 
 describe("stripJsonComments", () => {
@@ -85,7 +87,8 @@ describe("validateConfig", () => {
     };
     expect(() => validateConfig({ ...base, models })).toThrow(/healthEndpoint/);
     const m2 = { m: { provider: "p", targetBaseUrl: "http://x", metrics: { endpoint: "metrics" } } };
-    expect(() => validateConfig({ ...base, models: m2 })).toThrow(/metrics\.endpoint/);
+    // ajv reports the path in slash notation (…/metrics/endpoint)
+    expect(() => validateConfig({ ...base, models: m2 })).toThrow(/metrics\/endpoint/);
   });
 
   it("fills vramBackend with 'auto' and accepts explicit backends", () => {
@@ -140,6 +143,38 @@ describe("validateConfig", () => {
         models: { m: { provider: "p", targetBaseUrl: "http://x", targetHeaders: { "x": 5 } } as never },
       }),
     ).toThrow(/targetHeaders/);
+  });
+});
+
+describe("config.schema.json (direct ajv — anti-drift)", () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: false });
+  const schema = JSON.parse(readFileSync(new URL("../config.schema.json", import.meta.url), "utf8"));
+  const validate = ajv.compile(schema);
+
+  it("accepts the shipped example config", () => {
+    const example = JSON.parse(
+      stripJsonComments(readFileSync(new URL("../config.example.json", import.meta.url), "utf8")),
+    );
+    expect(validate(example)).toBe(true);
+  });
+
+  it("rejects unknown top-level keys", () => {
+    expect(validate({ models: { m: { provider: "p", targetBaseUrl: "http://x" } }, bogus: 1 })).toBe(false);
+    expect(validate.errors?.[0]?.keyword).toBe("additionalProperties");
+  });
+
+  it("rejects a model missing targetBaseUrl", () => {
+    expect(validate({ models: { m: { provider: "p" } } })).toBe(false);
+    expect(
+      validate.errors?.some((e) => e.message === "must have required property 'targetBaseUrl'"),
+    ).toBe(true);
+  });
+
+  it("rejects a non-URL targetBaseUrl and a missing / on healthEndpoint", () => {
+    expect(validate({ models: { m: { provider: "p", targetBaseUrl: "ftp://x" } } })).toBe(false);
+    expect(
+      validate({ models: { m: { provider: "p", targetBaseUrl: "http://x", healthEndpoint: "h" } } }),
+    ).toBe(false);
   });
 });
 

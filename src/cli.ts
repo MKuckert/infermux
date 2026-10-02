@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { loadConfigFile, ConfigError } from "./config.js";
 import { startProxy } from "./server.js";
 import type { RuntimeConfig } from "./types.js";
@@ -119,7 +120,15 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((err) => {
-  console.error(`infermux: fatal: ${err}`);
-  process.exit(1);
-});
+// Only run when invoked directly (`node dist/cli.js`), not when imported
+// (e.g. by unit tests — importing must not start the server or exit).
+const isMainEntry =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainEntry) {
+  main().catch((err) => {
+    console.error(`infermux: fatal: ${err}`);
+    process.exit(1);
+  });
+}

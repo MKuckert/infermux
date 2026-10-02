@@ -1,13 +1,20 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, extname } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as yaml from "js-yaml";
-import { VRAM_BACKENDS, type VramBackendName } from "./vram.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import type { ErrorObject, ValidateFunction } from "ajv/dist/2020.js";
+import type { VramBackendName } from "./vram.js";
 
 /**
  * Configuration model for infermux.
  *
  * Supported file formats: .json, .jsonc (naively stripped of // and /* *\/ comments),
  * .yaml / .yml.
+ *
+ * Structural validation is delegated to config.schema.json (draft 2020-12),
+ * compiled with ajv; this module adds only what a schema cannot express:
+ * built-in defaults and `${ENV_VAR}` expansion for secrets.
  */
 
 export interface ServerConfig {
@@ -104,7 +111,7 @@ export interface ModelConfig {
    * Optional static headers added to every upstream request, for providers
    * with non-OpenAI auth (e.g. `{ "x-api-key": "${LITELLM_KEY}" }`).
    * Values support `${ENV_VAR}` expansion; a `targetApiKey` (if set) takes
-   * precedence over a `authorization` entry here.
+   * precedence over an `authorization` entry here.
    */
   targetHeaders?: Record<string, string>;
   /** Optional non-standard metrics mapping for the stats endpoint. */
@@ -131,12 +138,43 @@ export const DEFAULTS: Required<DefaultsConfig> = {
   vramBackend: "auto",
 };
 
+export const SERVER_DEFAULTS: Pick<ServerConfig, "host" | "port"> = {
+  host: "0.0.0.0",
+  port: 8080,
+};
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ConfigError";
   }
 }
+
+// The schema lives at the repo root; both src/config.ts and dist/config.js
+// resolve ../config.schema.json to the same file.
+const SCHEMA_PATH = fileURLToPath(new URL("../config.schema.json", import.meta.url));
+
+function loadValidator(): ValidateFunction {
+  let text: string;
+  try {
+    text = readFileSync(SCHEMA_PATH, "utf8");
+  } catch (err) {
+    throw new ConfigError(
+      `config schema not readable at ${SCHEMA_PATH}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  let schema: object;
+  try {
+    schema = JSON.parse(text) as object;
+  } catch (err) {
+    throw new ConfigError(
+      `config schema is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return new Ajv2020({ allErrors: true, strict: false }).compile(schema);
+}
+
+const validateSchema = loadValidator();
 
 /**
  * Expand `${ENV_VAR}` references from the environment. An unset variable is a
@@ -203,158 +241,75 @@ function parseConfigText(raw: string, file: string): unknown {
   }
 }
 
-const isObj = (v: unknown): v is Record<string, unknown> =>
-  typeof v === "object" && v !== null && !Array.isArray(v);
+/**
+ * Validate a parsed config against config.schema.json. On failure, throws a
+ * ConfigError listing every violation with its JSON path.
+ */
+function assertSchema(raw: unknown, fileName: string): void {
+  if (validateSchema(raw)) return;
+  const problems = (validateSchema.errors ?? []).map((e: ErrorObject) => {
+    const path = e.instancePath || "(root)";
+    // ajv's default enum message is generic; spell out the allowed values.
+    const extra =
+      e.keyword === "enum"
+        ? ` (expected one of: ${(e.params as { allowedValues?: unknown[] }).allowedValues?.join(", ")})`
+        : "";
+    return `${path}: ${e.message ?? "invalid value"}${extra}`;
+  });
+  throw new ConfigError(`${fileName}: invalid config — ${problems.join("; ")}`);
+}
 
 /**
- * Pick a duration field. Must be a finite, non-negative number, and > 0 when
- * `nonNegative` is false. Returns undefined when the key is absent.
+ * Schema-validated raw input -> InfermuxConfig: fills built-in defaults and
+ * expands `${ENV_VAR}` references (the one transformation a schema cannot do).
  */
-function pickDurMs(
-  o: Record<string, unknown>,
-  key: string,
-  fileName: string,
-  nonNegative: boolean,
-): number | undefined {
-  const v = o[key];
-  if (v === undefined) return undefined;
-  if (typeof v !== "number" || !Number.isFinite(v)) {
-    throw new ConfigError(`${fileName}: ${key} must be a finite number (milliseconds)`);
+function finalize(raw: unknown, fileName: string): InfermuxConfig {
+  const r = raw as {
+    server?: { host?: string; port?: number; apiToken?: string };
+    defaults?: Record<string, unknown>;
+    models: Record<string, Record<string, unknown>>;
+  };
+
+  const server: ServerConfig = {
+    host: r.server?.host ?? SERVER_DEFAULTS.host,
+    port: r.server?.port ?? SERVER_DEFAULTS.port,
+  };
+  if (typeof r.server?.apiToken === "string") server.apiToken = r.server.apiToken;
+
+  const defaults = {
+    ...DEFAULTS,
+    // The schema has already checked types/ranges for every one of these keys.
+    ...(r.defaults ?? {}),
+  } as Required<DefaultsConfig>;
+
+  const models: Record<string, ModelConfig> = {};
+  for (const [alias, entry] of Object.entries(r.models ?? {})) {
+    // The schema guarantees the exact shape; the spread widens it to unknown.
+    const m = { ...entry } as unknown as ModelConfig;
+    if (typeof m.targetApiKey === "string") {
+      m.targetApiKey = expandEnv(m.targetApiKey, `${fileName}: models["${alias}"].targetApiKey`);
+    }
+    if (m.targetHeaders) {
+      for (const [hk, v] of Object.entries(m.targetHeaders)) {
+        m.targetHeaders[hk] = expandEnv(v, `${fileName}: models["${alias}"].targetHeaders["${hk}"]`);
+      }
+    }
+    models[alias] = m;
   }
-  if (nonNegative ? v < 0 : v <= 0) {
-    throw new ConfigError(`${fileName}: ${key} must be ${nonNegative ? ">= 0" : "> 0"} ms`);
-  }
-  return v;
+
+  return { server, defaults, models };
 }
 
-function pickStr(o: Record<string, unknown>, key: string): string | undefined {
-  const v = o[key];
-  return typeof v === "string" && v.length > 0 ? v : undefined;
-}
-
-function pickNum(o: Record<string, unknown>, key: string): number | undefined {
-  const v = o[key];
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
-}
-
+/**
+ * Validate a parsed config object (see config.schema.json) and return the
+ * fully-defaulted, typed InfermuxConfig.
+ */
 export function validateConfig(
   raw: unknown,
   fileName = "<memory>",
 ): InfermuxConfig {
-  if (!isObj(raw)) {
-    throw new ConfigError(`${fileName}: config root must be an object`);
-  }
-  const serverRaw = isObj(raw.server) ? raw.server : {};
-  const defaultsRaw = isObj(raw.defaults) ? raw.defaults : {};
-  const modelsRaw = isObj(raw.models) ? raw.models : {};
-
-  const server: ServerConfig = {
-    host: pickStr(serverRaw, "host") ?? "0.0.0.0",
-    port: pickNum(serverRaw, "port") ?? 8080,
-  };
-  if (pickStr(serverRaw, "apiToken") !== undefined) {
-    server.apiToken = pickStr(serverRaw, "apiToken");
-  }
-  if (server.port < 0 || server.port > 65535) {
-    throw new ConfigError(`${fileName}: server.port must be 0-65535`);
-  }
-
-  const d = defaultsRaw;
-  const dur = (key: keyof DefaultsConfig, nonNegative: boolean) =>
-    pickDurMs(d, key, `${fileName}: defaults.${key}`, nonNegative);
-  const defaults: Required<DefaultsConfig> = {
-    requestTimeoutMs: dur("requestTimeoutMs", false) ?? DEFAULTS.requestTimeoutMs,
-    healthCheckIntervalMs: dur("healthCheckIntervalMs", false) ?? DEFAULTS.healthCheckIntervalMs,
-    healthCheckTimeoutMs: dur("healthCheckTimeoutMs", false) ?? DEFAULTS.healthCheckTimeoutMs,
-    coolDownMs: dur("coolDownMs", true) ?? DEFAULTS.coolDownMs,
-    vramThresholdPct: pickNum(d, "vramThresholdPct") ?? DEFAULTS.vramThresholdPct,
-    vramCheckTimeoutMs: dur("vramCheckTimeoutMs", false) ?? DEFAULTS.vramCheckTimeoutMs,
-    vramCheckIntervalMs: dur("vramCheckIntervalMs", false) ?? DEFAULTS.vramCheckIntervalMs,
-    childKillGraceMs: dur("childKillGraceMs", false) ?? DEFAULTS.childKillGraceMs,
-    stopCommandTimeoutMs: dur("stopCommandTimeoutMs", false) ?? DEFAULTS.stopCommandTimeoutMs,
-    vramBackend: (VRAM_BACKENDS as readonly string[]).includes(pickStr(d, "vramBackend") ?? "auto")
-      ? ((pickStr(d, "vramBackend") ?? "auto") as VramBackendName)
-      : (() => {
-          throw new ConfigError(
-            `${fileName}: defaults.vramBackend must be one of ${VRAM_BACKENDS.join(", ")}`,
-          );
-        })(),
-  };
-  if (defaults.vramThresholdPct < 0 || defaults.vramThresholdPct > 1) {
-    throw new ConfigError(`${fileName}: defaults.vramThresholdPct must be between 0 and 1`);
-  }
-
-  const models: Record<string, ModelConfig> = {};
-  for (const [alias, entry] of Object.entries(modelsRaw)) {
-    if (!isObj(entry)) {
-      throw new ConfigError(`${fileName}: models["${alias}"] must be an object`);
-    }
-    const provider = pickStr(entry, "provider");
-    const targetBaseUrl = pickStr(entry, "targetBaseUrl");
-    if (!provider) throw new ConfigError(`${fileName}: models["${alias}"].provider is required`);
-    if (!targetBaseUrl)
-      throw new ConfigError(`${fileName}: models["${alias}"].targetBaseUrl is required`);
-    if (!/^https?:\/\//.test(targetBaseUrl))
-      throw new ConfigError(
-        `${fileName}: models["${alias}"].targetBaseUrl must start with http:// or https://`,
-      );
-    const m: ModelConfig = { provider, targetBaseUrl };
-    const tm = pickStr(entry, "targetModel");
-    if (tm !== undefined) m.targetModel = tm;
-    const sc = pickStr(entry, "startCommand");
-    if (sc !== undefined) m.startCommand = sc;
-    const stc = pickStr(entry, "stopCommand");
-    if (stc !== undefined) m.stopCommand = stc;
-    const cool = pickDurMs(entry, "coolDownMs", `${fileName}: models["${alias}"].coolDownMs`, true);
-    if (cool !== undefined) m.coolDownMs = cool;
-    const he = pickStr(entry, "healthEndpoint");
-    if (he !== undefined) {
-      if (!he.startsWith("/"))
-        throw new ConfigError(`${fileName}: models["${alias}"].healthEndpoint must start with "/"`);
-      m.healthEndpoint = he;
-    }
-    const vt = pickNum(entry, "vramThresholdPct");
-    if (vt !== undefined) {
-      if (vt < 0 || vt > 1)
-        throw new ConfigError(`${fileName}: models["${alias}"].vramThresholdPct must be 0..1`);
-      m.vramThresholdPct = vt;
-    }
-    const key = pickStr(entry, "targetApiKey");
-    if (key !== undefined) {
-      m.targetApiKey = expandEnv(key, `${fileName}: models["${alias}"].targetApiKey`);
-    }
-    if (isObj(entry.targetHeaders)) {
-      const headers: Record<string, string> = {};
-      for (const [hk, hv] of Object.entries(entry.targetHeaders)) {
-        if (typeof hv !== "string" || !hk.trim()) {
-          throw new ConfigError(`${fileName}: models["${alias}"].targetHeaders must map strings to strings`);
-        }
-        headers[hk] = expandEnv(hv, `${fileName}: models["${alias}"].targetHeaders["${hk}"]`);
-      }
-      m.targetHeaders = headers;
-    }
-    if (typeof entry.managed === "boolean") m.managed = entry.managed;
-    if (isObj(entry.metrics)) {
-      const metrics: MetricsMapping = {};
-      const me = pickStr(entry.metrics, "endpoint");
-      if (me !== undefined) {
-        if (!me.startsWith("/"))
-          throw new ConfigError(`${fileName}: models["${alias}"].metrics.endpoint must start with "/"`);
-        metrics.endpoint = me;
-      }
-      const vu = pickStr(entry.metrics, "vramUsedMiB");
-      if (vu !== undefined) metrics.vramUsedMiB = vu;
-      const vtt = pickStr(entry.metrics, "vramTotalMiB");
-      if (vtt !== undefined) metrics.vramTotalMiB = vtt;
-      m.metrics = metrics;
-    }
-    models[alias] = m;
-  }
-  if (Object.keys(models).length === 0) {
-    throw new ConfigError(`${fileName}: at least one entry under "models" is required`);
-  }
-
-  return { server, defaults, models };
+  assertSchema(raw, fileName);
+  return finalize(raw, fileName);
 }
 
 /**

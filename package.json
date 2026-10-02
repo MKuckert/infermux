@@ -14,7 +14,8 @@
   ],
   "license": "MIT",
   "files": [
-    "dist"
+    "dist",
+    "config.schema.json"
   ],
   "type": "module",
   "engines": {
@@ -38,6 +39,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.13.8",
+    "ajv": "^8.20.0",
     "hono": "^4.6.14",
     "js-yaml": "^4.1.0"
   },

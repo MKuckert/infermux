@@ -165,6 +165,20 @@ single-concurrency queue and engine-switching rules apply to all of them.
   deadline covers the *entire* request life; a request that exceeds it gets a
   `504` and the next client moves forward.
 
+### JSON schema
+
+`config.schema.json` (draft 2020-12) is the source of truth for the config
+format: the proxy validates every config against it with ajv at startup, and
+the schema is committed/shipped alongside. You can point your editor at it for
+autocomplete and inline validation — e.g. in `config.json`:
+
+```jsonc
+{ "$schema": "https://raw.githubusercontent.com/MKuckert/infermux/main/config.schema.json", ... }
+```
+
+(YAML configs can't use `$schema`, but any ajv-based tooling or CI check can
+validate them against the same file.)
+
 ### Environment overrides
 
 | Variable | Effect |
