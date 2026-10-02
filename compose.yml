@@ -1,0 +1,20 @@
+services:
+  infermux:
+    build: .
+    container_name: infermux
+    ports:
+      - "8080:8080"
+    volumes:
+      # Drop your own config in ./config.json (JSON / JSONC / YAML all work).
+      # The mount is optional — the image ships the example config.
+      - ./config.json:/app/config.json:ro
+    environment:
+      INFERMUX_LOG_LEVEL: info
+      # Examples (compose env wins over the config file):
+      # INFERMUX_PORT: "8080"
+      # INFERMUX_API_TOKEN: "change-me"
+    # Engines are spawned inside the container (see Dockerfile note).
+    # For engines running on the HOST, use "managed": false in config.json
+    # and reach them via:
+    #   extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped

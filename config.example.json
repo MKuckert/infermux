@@ -1,0 +1,64 @@
+{
+  // Server binding.
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    // Optional Bearer token. If set, /v1/chat/completions, /v1/completions and
+    // /v1/models require: Authorization: Bearer <token>
+    "apiToken": "replace-me"
+  },
+
+  "defaults": {
+    // Per-request deadline (queue wait + engine switch + upstream call).
+    "requestTimeoutMs": 120000,
+    "healthCheckIntervalMs": 500,
+    "healthCheckTimeoutMs": 30000,
+    // GPU cool-down buffer after stopping an engine, before starting a new one.
+    "coolDownMs": 3000,
+    // VRAM must drop below 15% of total before a new engine is started. 0 disables.
+    "vramThresholdPct": 0.15,
+    // VRAM source: "auto" (nvidia-smi/rocm-smi/amd-smi, unified RAM on macOS),
+    // "none" (no-op checker), or force one: "nvidia-smi" | "rocm-smi" | "amd-smi" | "macos".
+    "vramBackend": "auto",
+    "vramCheckTimeoutMs": 30000,
+    "vramCheckIntervalMs": 500,
+    // SIGTERM grace before SIGKILL for child processes.
+    "childKillGraceMs": 5000,
+    "stopCommandTimeoutMs": 10000
+  },
+
+  "models": {
+    "my-custom-llama": {
+      "provider": "ollama",
+      "targetBaseUrl": "http://127.0.0.1:11434",
+      "targetModel": "llama3:latest",
+      "startCommand": "ollama serve",
+      "stopCommand": "pkill -f 'ollama serve'",
+      "coolDownMs": 3000,
+      "healthEndpoint": "/api/version"
+    },
+    "my-vllm-model": {
+      "provider": "vllm",
+      "targetBaseUrl": "http://127.0.0.1:8000",
+      "targetModel": "Mistral-7B-Instruct-v0.2",
+      "startCommand": "vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000",
+      "stopCommand": "pkill -f 'vllm serve'",
+      "coolDownMs": 5000,
+      "healthEndpoint": "/health",
+      // Optional: scrape non-standard provider metrics for /v1/stats.
+      "metrics": {
+        "endpoint": "/metrics/vram",
+        "vramUsedMiB": "used_mib",
+        "vramTotalMiB": "total_mib"
+      }
+    },
+    // Proxy lives on a different host than the engine: the proxy never starts,
+    // stops or VRAM-gates it — it only health-checks and forwards.
+    "my-remote-mlx": {
+      "provider": "mlx",
+      "targetBaseUrl": "http://192.168.1.50:8080",
+      "managed": false,
+      "healthEndpoint": "/health"
+    }
+  }
+}

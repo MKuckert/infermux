@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Test & temp artifacts
+coverage/
+smoke-config.json
+tmp/
+*.tmp
+
+# Local config files (the example is committed; real ones may hold tokens)
+config.json
+config.local.*
+!config.example.json
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

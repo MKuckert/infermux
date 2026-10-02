@@ -1,0 +1,55 @@
+/**
+ * A strict serial (single-concurrency) queue.
+ *
+ * Tasks are executed one at a time, in FIFO order. `enqueue` returns a promise
+ * that settles with the task's result; a task that throws does not break the
+ * queue. `length` is the number of tasks currently running + waiting.
+ */
+export class SerialQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+  private depth = 0;
+
+  /** Number of tasks currently running or waiting. */
+  get length(): number {
+    return this.depth;
+  }
+
+  /** Number of tasks waiting (excluding the one currently running). */
+  get waiting(): number {
+    return this.running ? this.depth - 1 : this.depth;
+  }
+
+  get running(): boolean {
+    return this.depth > 0;
+  }
+
+  enqueue<T>(task: () => Promise<T>): Promise<T> {
+    this.depth++;
+    const run = this.tail.then(task);
+    // The chain must never reject, or the queue would stall.
+    this.tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    // Decrement after the *task* settles, so `length` reflects the queue while it runs.
+    void run.then(
+      () => {
+        this.depth--;
+      },
+      () => {
+        this.depth--;
+      },
+    );
+    return run;
+  }
+
+  /** Resolves once every enqueued task has settled. */
+  drain(): Promise<void> {
+    const current = this.tail;
+    this.tail = Promise.resolve();
+    return current.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+}
