@@ -90,8 +90,12 @@ export function buildApp(deps: ProxyDeps): Hono {
     const cfg = activeMetricsCfg();
     if (!cfg?.metrics?.endpoint) return;
     const url = `${cfg.targetBaseUrl.replace(/\/$/, "")}${cfg.metrics.endpoint}`;
+    // Same auth as inference requests — some providers guard metrics routes too.
+    const headers: Record<string, string> = {};
+    for (const [hk, hv] of Object.entries(cfg.targetHeaders ?? {})) headers[hk] = hv;
+    if (cfg.targetApiKey) headers.authorization = `Bearer ${cfg.targetApiKey}`;
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(2_000) });
       void res.body?.cancel();
       if (!res.ok) return;
       const doc = (await res.json()) as unknown;
@@ -213,7 +217,9 @@ export function buildApp(deps: ProxyDeps): Hono {
             signal: ctl.signal,
           });
         } catch (err) {
-          stats.recordError();
+          // (stats.recordError() happens exactly once, in the outer catch —
+          // this error path always lands there, so recording here too would
+          // double-count a single failed request.)
           if (ctl.signal.aborted) {
             const reason = ctl.signal.reason;
             if (reason instanceof Error && reason.message === "request timeout") {

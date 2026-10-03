@@ -112,6 +112,10 @@ export function startProxy(config: RuntimeConfig, level: "debug" | "info" | "war
           resolve();
         } else {
           server.close(() => resolve());
+          // Node 18 keeps open keep-alive sockets after close() and waits for
+          // them in the callback — idle ones must be destroyed explicitly, or
+          // a single keep-alive client (the OpenAI SDKs do this) blocks shutdown.
+          (server as unknown as { closeIdleConnections?: () => void }).closeIdleConnections?.();
         }
       });
       await queue.drain().catch(() => {});

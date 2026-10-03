@@ -33,9 +33,19 @@ export function parseArgs(argv: string[]): { configPath?: string; logLevel?: str
       printUsage();
       process.exit(0);
     } else if (a === "--config" || a === "-c") {
-      out.configPath = argv[++i];
+      const v = argv[++i];
+      if (v === undefined) {
+        console.error("infermux: --config requires a path");
+        process.exit(2);
+      }
+      out.configPath = v;
     } else if (a === "--log-level") {
-      out.logLevel = argv[++i];
+      const v = argv[++i];
+      if (v === undefined) {
+        console.error("infermux: --log-level requires a value");
+        process.exit(2);
+      }
+      out.logLevel = v;
     } else {
       console.error(`infermux: unknown argument: ${a}`);
       printUsage();
@@ -118,6 +128,16 @@ async function main(): Promise<void> {
   process.on("unhandledRejection", (err) => {
     log(`unhandled rejection: ${err}`);
   });
+
+  // Fail loudly if the listener never bound (e.g. EADDRINUSE): `ready`
+  // rejects, and a process that isn't listening must not keep running.
+  try {
+    await proxy.ready;
+  } catch (err) {
+    console.error(`infermux: server failed to start: ${err instanceof Error ? err.message : String(err)}`);
+    await proxy.close().catch(() => {});
+    process.exit(1);
+  }
 }
 
 // Only run when invoked directly (`node dist/cli.js`), not when imported
