@@ -321,7 +321,7 @@ export class EngineManager {
       // per-attempt value, but it must never push a single stalled probe past
       // the overall deadline.
       const remaining = Math.max(1, deadline - Date.now());
-      const ok = await this.healthCheck(url, Math.min(d.healthCheckTimeoutMs, remaining));
+      const ok = await this.healthCheck(cfg, url, Math.min(d.healthCheckTimeoutMs, remaining));
       if (ok) return;
       lastErr = "non-200";
       if (Date.now() >= deadline) break;
@@ -355,9 +355,16 @@ export class EngineManager {
   }
 
   /** One health probe: HTTP 200 -> true. */
-  private async healthCheck(url: string, timeoutMs: number): Promise<boolean> {
+  private async healthCheck(cfg: ModelConfig, url: string, timeoutMs: number): Promise<
+    boolean
+  > {
     try {
+      // Remote engines often protect every route (including /v1/models)
+      // behind the provider key — send it when configured.
+      const headers: Record<string, string> = {};
+      if (cfg.targetApiKey) headers.authorization = `Bearer ${cfg.targetApiKey}`;
       const res = await fetch(url, {
+        headers,
         signal: AbortSignal.timeout(timeoutMs),
         redirect: "manual",
       });

@@ -17,6 +17,9 @@ tmp/
 
 # Local config files (the example is committed; real ones may hold tokens)
 config.json
+config.jsonc
+config.yaml
+config.yml
 config.local.*
 !config.example.json
 
