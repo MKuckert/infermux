@@ -80,11 +80,8 @@ export function startProxy(config: RuntimeConfig, level: "debug" | "info" | "war
     ready = Promise.resolve(bs.port ?? port);
     listeningLog();
   } else {
-    const nodeServer = nodeServe({ fetch: app.fetch, hostname: host, port }, (info) => {
-      const addr = info.address ?? `${host}:${port}`;
-      log(
-        `listening on http://${addr} (models: ${Object.keys(config.models).join(", ")}, auth: ${config.server.apiToken ? "required" : "off"}, runtime: node)`,
-      );
+    const nodeServer = nodeServe({ fetch: app.fetch, hostname: host, port }, () => {
+      listeningLog();
     });
     server = nodeServer as unknown as ServerHandle; // http.Server is structurally compatible
     ready = new Promise<number>((resolvePort, rejectPort) => {
