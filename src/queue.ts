@@ -14,9 +14,13 @@ export class SerialQueue {
     return this.depth;
   }
 
-  /** Number of tasks waiting (excluding the one currently running). */
+  /**
+   * Number of tasks waiting (excluding the one currently running).
+   * `depth` counts the running task too, so this is max(depth-1, 0) —
+   * 0 both when idle and when exactly one task is in flight.
+   */
   get waiting(): number {
-    return this.running ? this.depth - 1 : this.depth;
+    return Math.max(this.depth - 1, 0);
   }
 
   get running(): boolean {
