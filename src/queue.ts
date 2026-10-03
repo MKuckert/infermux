@@ -30,13 +30,11 @@ export class SerialQueue {
   enqueue<T>(task: () => Promise<T>): Promise<T> {
     this.depth++;
     const run = this.tail.then(task);
-    // The chain must never reject, or the queue would stall.
+    // The chain must never reject, or the queue would stall — so both paths
+    // settle to undefined. Decrementing here (in the tail handler itself) means
+    // `length` reflects the queue while a task runs, and is already decremented
+    // before the next task starts: no microtask of overcount.
     this.tail = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    // Decrement after the *task* settles, so `length` reflects the queue while it runs.
-    void run.then(
       () => {
         this.depth--;
       },
