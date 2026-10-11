@@ -127,8 +127,37 @@ single-concurrency queue and engine-switching rules apply to all of them.
   (e.g. `"x-api-key"` for LiteLLM/Anthropic-style providers). A `targetApiKey`
   takes precedence over an `authorization` entry in `targetHeaders`.
 - **`${ENV_VAR}` expansion** — both fields expand environment variables at load
-  time, keeping secrets out of the config file. An unset variable is a startup
-  error (with the variable named), not a silent bad-auth at request time.
+  time, keeping secrets out of the config file (see *Environment variable
+  expansion* below).
+
+### Environment variable expansion
+
+Any string in the config file — every field, and even model aliases (keys) —
+may reference environment variables as `${ENV_VAR}`. Expansion is a simple
+search-and-replace over every string at load time, applied **before** schema
+validation:
+
+- **Nested references work** — `"http://127.0.0.1:${OLLAMA_PORT}"` expands to
+  `http://127.0.0.1:11434`; multiple references in one string are fine.
+- **Casts for typed fields** — when a *whole value* is a single reference with
+  a cast, the result is replaced by that type instead of a string:
+  `"port": "${PROXY_PORT:int}"`, `"vramThresholdPct": "${VRAM_PCT:float}"`.
+  Casts are `int` (integer) and `float` (any number); anything else is a
+  load-time error. A cast inside a larger string is an error too — the result
+  would be a string where the schema expects a number.
+- **Unset variables are a startup error** (with the variable named), not a
+  silent bad-auth or schema failure at request time. An empty variable is fine
+  for plain references but an error when a cast is requested.
+- **Malformed references are a startup error** — a `${` with no closing `}`
+  (a typo) fails the load. Closed-but-non-reference forms such as shell
+  `${var:-default}` are left untouched, and two keys that expand to the same
+  name (e.g. `"x"` and `"${A}"` with `A=x`) are rejected instead of silently
+  overwriting each other.
+- **No recursive expansion** — the *value* of an env var is inserted verbatim:
+  a `${...}` sequence inside it is not itself expanded.
+
+This keeps secrets (`targetApiKey`, `targetHeaders`) *and* machine-specific
+values (ports, hosts, timeouts) out of the config file.
 
 ### Key semantics
 

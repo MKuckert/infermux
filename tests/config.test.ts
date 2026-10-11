@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import Ajv2020 from "ajv/dist/2020.js";
 import { validateConfig, stripJsonComments, loadConfigFile, ConfigError } from "../src/config.js";
 
@@ -146,6 +147,153 @@ describe("validateConfig", () => {
   });
 });
 
+describe("${ENV} expansion across the whole config", () => {
+  const base = {
+    models: { m: { provider: "p", targetBaseUrl: "http://x" } },
+  };
+
+  it("expands references in any string value, not just api key/headers", () => {
+    process.env.IMX_HOST = "10.0.0.5";
+    process.env.IMX_PORT = "9123";
+    const cfg = validateConfig({
+      ...base,
+      server: { host: "${IMX_HOST}", port: 1 },
+      models: {
+        m: { provider: "p", targetBaseUrl: "http://127.0.0.1:${IMX_PORT}", startCommand: "ollama serve ${IMX_HOST}" },
+      },
+    });
+    expect(cfg.server.host).toBe("10.0.0.5");
+    // nested inside a larger string: plain text substitution
+    expect(cfg.models.m!.targetBaseUrl).toBe("http://127.0.0.1:9123");
+    expect(cfg.models.m!.startCommand).toBe("ollama serve 10.0.0.5");
+    delete process.env.IMX_HOST;
+    delete process.env.IMX_PORT;
+  });
+
+  it("expands multiple references in one string and leaves plain strings untouched", () => {
+    process.env.IMX_A = "a";
+    process.env.IMX_B = "b";
+    const cfg = validateConfig({
+      ...base,
+      models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "run ${IMX_A} and ${IMX_B}" } },
+    });
+    expect(cfg.models.m!.startCommand).toBe("run a and b");
+    // no references -> unchanged
+    expect(cfg.models.m!.targetBaseUrl).toBe("http://x");
+    delete process.env.IMX_A;
+    delete process.env.IMX_B;
+  });
+
+  it("expands object keys (model aliases)", () => {
+    process.env.IMX_ALIAS = "my-alias";
+    const cfg = validateConfig({
+      models: { "${IMX_ALIAS}": { provider: "p", targetBaseUrl: "http://x" } },
+    });
+    expect(cfg.models["my-alias"]!.provider).toBe("p");
+    delete process.env.IMX_ALIAS;
+  });
+
+  it("casts ${VAR:int} to a real number that satisfies the schema", () => {
+    process.env.IMX_PORT = "9123";
+    const cfg = validateConfig({
+      ...base,
+      server: { port: "${IMX_PORT:int}" },
+    });
+    expect(cfg.server.port).toBe(9123);
+    delete process.env.IMX_PORT;
+  });
+
+  it("casts ${VAR:float} to a number for fractional fields", () => {
+    process.env.IMX_PCT = "0.25";
+    const cfg = validateConfig({
+      ...base,
+      defaults: { vramThresholdPct: "${IMX_PCT:float}" },
+    });
+    expect(cfg.defaults.vramThresholdPct).toBe(0.25);
+    delete process.env.IMX_PCT;
+  });
+
+  it("rejects non-integer values for :int and non-numeric values for :float", () => {
+    process.env.IMX_BAD_INT = "12.5";
+    expect(() =>
+      validateConfig({ ...base, server: { port: "${IMX_BAD_INT:int}" } }),
+    ).toThrow(/not an integer/);
+    process.env.IMX_BAD_FLOAT = "abc";
+    expect(() =>
+      validateConfig({ ...base, defaults: { vramThresholdPct: "${IMX_BAD_FLOAT:float}" } }),
+    ).toThrow(/not a number/);
+    delete process.env.IMX_BAD_INT;
+    delete process.env.IMX_BAD_FLOAT;
+  });
+
+  it("rejects an empty env var when a cast is requested", () => {
+    process.env.IMX_EMPTY = "";
+    expect(() =>
+      validateConfig({ ...base, server: { port: "${IMX_EMPTY:int}" } }),
+    ).toThrow(/empty/);
+    delete process.env.IMX_EMPTY;
+  });
+
+  it("rejects unknown cast specifiers", () => {
+    process.env.IMX_X = "1";
+    expect(() =>
+      validateConfig({ ...base, server: { port: "${IMX_X:bool}" } }),
+    ).toThrow(/unknown type cast/);
+    delete process.env.IMX_X;
+  });
+
+  it("rejects a cast nested inside a larger string", () => {
+    process.env.IMX_MS = "500";
+    expect(() =>
+      validateConfig({ ...base, defaults: { requestTimeoutMs: "${IMX_MS:int}x" as never } }),
+    ).toThrow(/only allowed when the whole value is a single variable reference/);
+    delete process.env.IMX_MS;
+  });
+
+  it("fails when a referenced env var is unset, wherever it appears", () => {
+    delete process.env.IMX_UNSET_ANYWHERE;
+    expect(() =>
+      validateConfig({ ...base, defaults: { requestTimeoutMs: "${IMX_UNSET_ANYWHERE:int}" } }),
+    ).toThrow(/IMX_UNSET_ANYWHERE/);
+  });
+
+  it("fails on an unclosed ${ reference (typo detection)", () => {
+    expect(() =>
+      validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "ollama serve ${IMX_HOST" } } }),
+    ).toThrow(/unclosed/);
+    // also when the whole value is a malformed reference
+    expect(() =>
+      validateConfig({ ...base, server: { port: "${IMX_PORT" as never } }),
+    ).toThrow(/unclosed/);
+  });
+
+  it("leaves closed-but-non-reference forms (shell syntax) untouched", () => {
+    const cfg = validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "run ${SHELL_VAR:-default}" } } });
+    expect(cfg.models.m!.startCommand).toBe("run ${SHELL_VAR:-default}");
+  });
+
+  it("rejects keys that expand to the same name (collision)", () => {
+    process.env.IMX_ALIAS = "m";
+    try {
+      expect(() =>
+        validateConfig({ models: { m: { provider: "p", targetBaseUrl: "http://x" }, "${IMX_ALIAS}": { provider: "p", targetBaseUrl: "http://y" } } }),
+      ).toThrow(/collides/);
+    } finally {
+      delete process.env.IMX_ALIAS;
+    }
+  });
+
+  it("does not re-expand ${...} sequences inside env var values", () => {
+    process.env.IMX_OUTER = "run ${IMX_INNER}";
+    try {
+      const cfg = validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "${IMX_OUTER}" } } });
+      expect(cfg.models.m!.startCommand).toBe("run ${IMX_INNER}");
+    } finally {
+      delete process.env.IMX_OUTER;
+    }
+  });
+});
+
 describe("config.schema.json (direct ajv — anti-drift)", () => {
   const ajv = new Ajv2020({ allErrors: true, strict: false });
   const schema = JSON.parse(readFileSync(new URL("../config.schema.json", import.meta.url), "utf8"));
@@ -183,5 +331,29 @@ describe("loadConfigFile", () => {
     const cfg = loadConfigFile(new URL("../config.example.json", import.meta.url).pathname);
     expect(cfg.models["my-custom-llama"]!.provider).toBe("ollama");
     expect(cfg.models["my-vllm-model"]!.metrics?.endpoint).toBe("/metrics/vram");
+  });
+
+  it("expands env vars (incl. unquoted YAML casts) in a .yaml file", () => {
+    const dir = mkdtempSync(tmpdir() + "/infermux-env-");
+    const file = dir + "/cfg.yaml";
+    writeFileSync(
+      file,
+      [
+        "server:",
+        "  port: ${IMX_YAML_PORT:int}",
+        "models:",
+        "  m:",
+        "    provider: p",
+        "    targetBaseUrl: http://127.0.0.1:${IMX_YAML_PORT}",
+      ].join("\n"),
+    );
+    process.env.IMX_YAML_PORT = "7777";
+    try {
+      const cfg = loadConfigFile(file);
+      expect(cfg.server.port).toBe(7777);
+      expect(cfg.models.m!.targetBaseUrl).toBe("http://127.0.0.1:7777");
+    } finally {
+      delete process.env.IMX_YAML_PORT;
+    }
   });
 });

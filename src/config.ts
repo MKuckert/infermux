@@ -14,7 +14,8 @@ import type { VramBackendName } from "./vram.js";
  *
  * Structural validation is delegated to config.schema.json (draft 2020-12),
  * compiled with ajv; this module adds only what a schema cannot express:
- * built-in defaults and `${ENV_VAR}` expansion for secrets.
+ * built-in defaults and `${ENV_VAR}` expansion across the whole config
+ * (applied before validation, so casts can supply schema-expected types).
  */
 
 export interface ServerConfig {
@@ -103,8 +104,9 @@ export interface ModelConfig {
   managed?: boolean;
   /**
    * Optional provider API key forwarded to the target endpoint as
-   * `Authorization: Bearer <key>`. Supports `${ENV_VAR}` expansion so secrets
-   * need not live in the config file (unset vars are a load-time error).
+   * `Authorization: Bearer <key>`. Any string in the config supports
+   * `${ENV_VAR}` expansion, so secrets need not live in the config file
+   * (unset vars are a load-time error).
    */
   targetApiKey?: string;
   /**
@@ -176,19 +178,112 @@ function loadValidator(): ValidateFunction {
 
 const validateSchema = loadValidator();
 
+/** Matches `${VAR}` and `${VAR:cast}` references. */
+const ENV_REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[A-Za-z]+)?\}/g;
+
 /**
- * Expand `${ENV_VAR}` references from the environment. An unset variable is a
- * load-time config error — a literal `${MISSING}` silently sent to the
- * provider would be an opaque auth failure at request time.
+ * Look up an env var, failing loudly at load time: a literal `${MISSING}`
+ * silently sent to the provider would be an opaque auth failure at request
+ * time.
  */
-function expandEnv(value: string, ctx: string): string {
-  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (whole, name: string) => {
-    const v = process.env[name];
-    if (v === undefined) {
-      throw new ConfigError(`${ctx}: environment variable ${name} is not set (referenced as ${whole})`);
+function lookupEnv(name: string, whole: string, ctx: string): string {
+  const v = process.env[name];
+  if (v === undefined) {
+    throw new ConfigError(`${ctx}: environment variable ${name} is not set (referenced as ${whole})`);
+  }
+  return v;
+}
+
+/**
+ * Plain search-replace of every `${VAR}` reference in a string. A `:cast`
+ * specifier is only meaningful when the whole value is one reference (see
+ * expandEnvValue); anywhere else it is a user error.
+ */
+function expandEnvText(value: string, ctx: string): string {
+  // A `${` with no closing `}` cannot be a reference — fail loudly instead of
+  // shipping the literal to the provider/shell. (Closed-but-malformed forms
+  // like `${var:-default}` are left alone: they are legitimate shell syntax.
+  // Likewise, ${...} sequences inside env var *values* are not re-expanded.)
+  const unclosed = value.match(/\$\{[^}]*$/);
+  if (unclosed) {
+    throw new ConfigError(
+      `${ctx}: unclosed environment variable reference ${unclosed[0]} (missing closing "}")`,
+    );
+  }
+  return value.replace(ENV_REF, (whole, name: string) => {
+    if (whole.includes(":")) {
+      throw new ConfigError(
+        `${ctx}: type cast in ${whole} is only allowed when the whole value is a single variable reference`,
+      );
     }
-    return v;
+    return lookupEnv(name, whole, ctx);
   });
+}
+
+/**
+ * Expand a string value. If the *entire* value is a single typed reference
+ * (e.g. `${OMLX_PORT:int}`), the result is cast to a number so it satisfies
+ * numeric schema fields; otherwise every reference is substituted as text,
+ * which allows variables nested inside larger strings
+ * (e.g. `"http://localhost:${PORT}"`).
+ */
+function expandEnvValue(value: string, ctx: string): unknown {
+  const whole = value.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*):([A-Za-z]+)\}$/);
+  if (whole) {
+    const [, name, cast] = whole;
+    const raw = lookupEnv(name!, whole[0], ctx);
+    if (raw === "") {
+      throw new ConfigError(`${ctx}: environment variable ${name} is empty; cannot cast to ${cast}`);
+    }
+    const n = Number(raw);
+    if (cast === "int") {
+      if (!Number.isInteger(n)) {
+        throw new ConfigError(`${ctx}: environment variable ${name} is "${raw}", not an integer (referenced as ${whole[0]})`);
+      }
+      return n;
+    }
+    if (cast === "float") {
+      if (!Number.isFinite(n)) {
+        throw new ConfigError(`${ctx}: environment variable ${name} is "${raw}", not a number (referenced as ${whole[0]})`);
+      }
+      return n;
+    }
+    throw new ConfigError(`${ctx}: unknown type cast "${cast}" in ${whole[0]} (expected int or float)`);
+  }
+  return expandEnvText(value, ctx);
+}
+
+/**
+ * Recursively expand `${ENV_VAR}` references in every string of the parsed
+ * config — object values and keys alike. Runs before schema validation so
+ * cast references can produce the types the schema expects.
+ */
+function expandConfigEnv(value: unknown, ctx: string): unknown {
+  if (typeof value === "string") return expandEnvValue(value, ctx);
+  if (Array.isArray(value)) {
+    return value.map((v, i) => expandConfigEnv(v, `${ctx}[${i}]`));
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    // Tracks which original key produced each expanded key, so an expansion
+    // that collides with a sibling key is an error instead of a silent
+    // overwrite (e.g. "x" and "${A}" with A=x).
+    const sources = new Map<string, string>();
+    for (const [k, v] of Object.entries(value)) {
+      // Keys stay strings: plain expansion only (a cast in a key is an error).
+      const key = expandEnvText(k, `${ctx} key "${k}"`);
+      const prev = sources.get(key);
+      if (prev !== undefined) {
+        throw new ConfigError(
+          `${ctx}: key "${k}" expands to "${key}", which collides with key "${prev}"`,
+        );
+      }
+      sources.set(key, k);
+      out[key] = expandConfigEnv(v, `${ctx}.${k}`);
+    }
+    return out;
+  }
+  return value;
 }
 
 /** Strip // and /* *\/ comments from a JSON document (string/comment-aware). */
@@ -260,10 +355,10 @@ function assertSchema(raw: unknown, fileName: string): void {
 }
 
 /**
- * Schema-validated raw input -> InfermuxConfig: fills built-in defaults and
- * expands `${ENV_VAR}` references (the one transformation a schema cannot do).
+ * Schema-validated, env-expanded raw input -> InfermuxConfig: fills built-in
+ * defaults (the only remaining transformation a schema cannot do).
  */
-function finalize(raw: unknown, fileName: string): InfermuxConfig {
+function finalize(raw: unknown): InfermuxConfig {
   const r = raw as {
     server?: { host?: string; port?: number; apiToken?: string };
     defaults?: Record<string, unknown>;
@@ -285,16 +380,7 @@ function finalize(raw: unknown, fileName: string): InfermuxConfig {
   const models: Record<string, ModelConfig> = {};
   for (const [alias, entry] of Object.entries(r.models ?? {})) {
     // The schema guarantees the exact shape; the spread widens it to unknown.
-    const m = { ...entry } as unknown as ModelConfig;
-    if (typeof m.targetApiKey === "string") {
-      m.targetApiKey = expandEnv(m.targetApiKey, `${fileName}: models["${alias}"].targetApiKey`);
-    }
-    if (m.targetHeaders) {
-      for (const [hk, v] of Object.entries(m.targetHeaders)) {
-        m.targetHeaders[hk] = expandEnv(v, `${fileName}: models["${alias}"].targetHeaders["${hk}"]`);
-      }
-    }
-    models[alias] = m;
+    models[alias] = { ...entry } as unknown as ModelConfig;
   }
 
   return { server, defaults, models };
@@ -303,13 +389,18 @@ function finalize(raw: unknown, fileName: string): InfermuxConfig {
 /**
  * Validate a parsed config object (see config.schema.json) and return the
  * fully-defaulted, typed InfermuxConfig.
+ *
+ * `${ENV_VAR}` references are expanded (with optional `:int`/`:float` casts)
+ * across the whole object *before* schema validation, so a cast can supply
+ * the numeric type a field expects.
  */
 export function validateConfig(
   raw: unknown,
   fileName = "<memory>",
 ): InfermuxConfig {
-  assertSchema(raw, fileName);
-  return finalize(raw, fileName);
+  const expanded = expandConfigEnv(raw, fileName);
+  assertSchema(expanded, fileName);
+  return finalize(expanded);
 }
 
 /**

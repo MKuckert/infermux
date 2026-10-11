@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/infermux/infermux/main/config.schema.json",
   "title": "infermux configuration",
-  "description": "Configuration for the infermux OpenAI-compatible inference proxy.",
+  "description": "Configuration for the infermux OpenAI-compatible inference proxy. Any string value (or key) may contain ${ENV_VAR} references, expanded at load time before validation; a whole value of ${ENV_VAR:int} or ${ENV_VAR:float} is cast to a number.",
   "type": "object",
   "required": ["models"],
   "additionalProperties": false,

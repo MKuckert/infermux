@@ -1,4 +1,9 @@
 {
+  // Every string in this file may reference environment variables as
+  // ${ENV_VAR} (expanded at load time, before validation; unset vars fail
+  // startup). A whole value of ${ENV_VAR:int} or ${ENV_VAR:float} is cast to
+  // a number, e.g. "port": "${PROXY_PORT:int}".
+
   // Server binding.
   "server": {
     "host": "0.0.0.0",
