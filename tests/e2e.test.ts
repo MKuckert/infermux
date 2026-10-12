@@ -143,9 +143,9 @@ describe("infermux end-to-end", () => {
         provider: "ollama",
         targetBaseUrl: providerBase,
         targetModel: "llama3:latest",
-        // Dummy engine: a tiny node process that idles.
-        startCommand: `node -e "setInterval(()=>{},1e3)"`,
-        stopCommand: "true",
+        // Dummy engine: a tiny node process that idles; the proxy holds a
+        // handle on it and kills its process group on stop/shutdown.
+        command: `node -e "setInterval(()=>{},1e3)"`,
         healthEndpoint: "/health",
       },
       // A second provider forces a full stop->start transition.
@@ -153,8 +153,7 @@ describe("infermux end-to-end", () => {
         provider: "vllm",
         targetBaseUrl: providerBase,
         targetModel: "Mistral-7B-Instruct-v0.2",
-        startCommand: `node -e "setInterval(()=>{},1e3)"`,
-        stopCommand: "true",
+        command: `node -e "setInterval(()=>{},1e3)"`,
         healthEndpoint: "/health",
       },
     },

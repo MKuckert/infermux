@@ -13,10 +13,13 @@ time**. infermux sits in front of any number of engines and solves this with:
    their turn instead of timing out early.
 3. **Dynamic engine lifecycles** — when the requested model is served by a
    *different* engine than the active one, infermux automatically:
-   1. runs the active engine's `stopCommand` (and/or `SIGTERM`→`SIGKILL` on the child process it spawned),
+   1. stops the active engine — via its `commands.stop` shell command, or by
+      killing the whole process group of the child it spawned for `command`
+      (SIGTERM, then SIGKILL),
    2. waits a configurable `coolDownMs` buffer for GPU driver cleanup,
    3. verifies VRAM has dropped below a threshold (optional, OS-agnostic),
-   4. runs the new engine's `startCommand`, then
+   4. starts the new engine — via its `command` (spawned child, process
+      handle held) or `commands.start` shell command, then
    5. polls the provider's health endpoint until it returns HTTP 200 —
       *only then* forwards the request.
 4. **Auth & config** — configurable host/port, optional `Bearer` token
@@ -75,8 +78,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
       "provider": "ollama",                     // models sharing a provider share one engine
       "targetBaseUrl": "http://127.0.0.1:11434",
       "targetModel": "llama3:latest",           // request `model` is rewritten to this
-      "startCommand": "ollama serve",
-      "stopCommand": "pkill -f 'ollama serve'",
+      "command": "ollama serve",                // mode A: spawned child, process group killed on stop
+      // "commands": {                          // mode B (alternative): separate start/stop commands,
+      //   "start": "nohup ollama serve &",     // no process handle held; `stop` stops the engine
+      //   "stop": "pkill -f 'ollama serve'"
+      // },
       "coolDownMs": 3000,                       // optional per-model override
       "healthEndpoint": "/api/version"          // must return HTTP 200
     },
@@ -84,8 +90,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
       "provider": "vllm",
       "targetBaseUrl": "http://127.0.0.1:8000",
       "targetModel": "Mistral-7B-Instruct-v0.2",
-      "startCommand": "vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000",
-      "stopCommand": "pkill -f 'vllm serve'",
+      "commands": {
+        "start": "nohup vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000 &",
+        "stop": "pkill -f 'vllm serve'"
+      },
       "coolDownMs": 5000,
       "healthEndpoint": "/health"
     },
@@ -107,7 +115,7 @@ If the proxy must run somewhere else (a GPU box runs the engines, the proxy
 runs on your laptop/server, in Docker, …):
 
 - set `"managed": false` on every model that lives on the other host — the
-  proxy will **not** run `startCommand`/`stopCommand` locally, spawn no child,
+  proxy will **not** run its start/stop commands locally, spawn no child,
   and skip the local VRAM gate; it only polls `healthEndpoint` before forwarding.
 - point `targetBaseUrl` at the engine host (from Docker, use
   `host.docker.internal` + `extra_hosts: ["host.docker.internal:host-gateway"]`).
@@ -167,17 +175,28 @@ values (ports, hosts, timeouts) out of the config file.
 - **Provider = engine** — two models with the same `provider` value are served
   by the *same* engine process; switching between them does **not** restart
   anything. A provider change triggers the full stop → cooldown → VRAM gate →
-  start → health-poll transition.
-- **Engine children** — `startCommand` is spawned by the proxy (shell) and
-  tracked: on `SIGINT`/`SIGTERM` the proxy runs `stopCommand` and terminates
-  the child's whole *process group* (SIGTERM, then SIGKILL after
-  `childKillGraceMs`), so grandchildren of the shell (e.g. `ollama serve`
-  behind `sh -c`) are killed too. If a managed child dies on its own, the next
-  request restarts it. If a model has no `startCommand`, the engine is assumed
-  to be externally managed.
-  If a transition to a new engine **fails** (e.g. the health endpoint never
-  comes up), the half-started child is killed and the previously active engine
-  is restored best-effort, so the old models keep working.
+  start → health-poll transition. All aliases of one provider must declare the
+  *same* lifecycle mode (`command`, `commands`, or neither) — a mixed setup is
+  rejected at load time, since the shared engine could then no longer be
+  restarted through some aliases.
+- **Engine lifecycles** — a model declares exactly one of:
+  - **`command` (mode A)** — a single shell command the proxy spawns and
+    holds a process handle on. Stopping kills the child's whole *process*
+    group (SIGTERM, then SIGKILL after `childKillGraceMs`), so grandchildren
+    of the shell (e.g. `ollama serve` behind `sh -c`) are killed too. If the
+    child dies on its own, the next request restarts it.
+  - **`commands` (mode B)** — separate `start`/`stop` shell commands. The
+    proxy fires `start` *without* holding a process handle (it may launch
+    another server process) and only tracks that the engine was started;
+    `stop` is run to stop it. Because there is no handle, a dead engine is
+    not detected automatically — readiness is established by the health poll.
+  - **neither** — the engine is assumed to be externally managed: the proxy
+    only health-checks and forwards.
+  On `SIGINT`/`SIGTERM` the proxy stops the active engine the same way as on
+  a switch. If a transition to a new engine **fails** (e.g. the health
+  endpoint never comes up), the half-started engine is torn down (process
+  group kill / stop command) and the previously active engine is restored
+  best-effort, so the old models keep working.
 - **Remote / unmanaged models** — `"managed": false` opts a model out of local
   lifecycle management (see above); for these, only the health poll runs.
 - **VRAM source** — `vramBackend` picks the checker: `"auto"` probes

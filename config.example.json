@@ -37,8 +37,17 @@
       "provider": "ollama",
       "targetBaseUrl": "http://127.0.0.1:11434",
       "targetModel": "llama3:latest",
-      "startCommand": "ollama serve",
-      "stopCommand": "pkill -f 'ollama serve'",
+      // Lifecycle mode A: a single command the proxy spawns and holds a
+      // process handle on; stopping kills its whole process group.
+      "command": "ollama serve",
+      // Lifecycle mode B (alternative to "command"): separate start/stop
+      // shell commands. The proxy holds no process handle (start may launch
+      // another server process) and only tracks that the engine was started;
+      // "stop" stops it.
+      // "commands": {
+      //   "start": "nohup ollama serve >/dev/null 2>&1 &",
+      //   "stop": "pkill -f 'ollama serve'"
+      // },
       "coolDownMs": 3000,
       "healthEndpoint": "/api/version"
     },
@@ -51,8 +60,10 @@
       // "targetApiKey": "${MY_PROVIDER_KEY}",
       // Non-OpenAI auth schemes via static headers (take a ${ENV} ref too).
       // "targetHeaders": { "x-api-key": "${LITELLM_KEY}" },
-      "startCommand": "vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000",
-      "stopCommand": "pkill -f 'vllm serve'",
+      "commands": {
+        "start": "nohup vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000 >/dev/null 2>&1 &",
+        "stop": "pkill -f 'vllm serve'"
+      },
       "coolDownMs": 5000,
       "healthEndpoint": "/health",
       // Optional: scrape non-standard provider metrics for /v1/stats.

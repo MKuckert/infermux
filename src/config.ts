@@ -51,7 +51,7 @@ export interface DefaultsConfig {
   vramCheckIntervalMs: number;
   /** Grace period between SIGTERM and SIGKILL for child processes, in ms. Default: 5000 */
   childKillGraceMs: number;
-  /** Max time to wait for a shell `stopCommand` to finish, in ms. Default: 10000 */
+  /** Max time to wait for a shell stop command (`commands.stop`) to finish, in ms. Default: 10000 */
   stopCommandTimeoutMs: number;
   /**
    * VRAM source: `"auto"` (default) probes nvidia-smi/rocm-smi/amd-smi, and on
@@ -75,6 +75,19 @@ export interface MetricsMapping {
   vramTotalMiB?: string;
 }
 
+/**
+ * Lifecycle mode B: separate start/stop shell commands. The proxy fires
+ * `start` without holding a process handle (it may launch another server
+ * process) and only tracks whether the engine was started; `stop` is run to
+ * stop it.
+ */
+export interface EngineCommands {
+  /** Shell command that starts the engine (run via /bin/sh, fire-and-forget). */
+  start: string;
+  /** Shell command that stops the engine (run via /bin/sh). */
+  stop: string;
+}
+
 export interface ModelConfig {
   /** Provider name, e.g. "ollama" | "vllm" | "lmstudio". Requests to the same provider share one engine instance. */
   provider: string;
@@ -85,10 +98,16 @@ export interface ModelConfig {
    * field is passed through unchanged.
    */
   targetModel?: string;
-  /** Shell command that starts the engine (run via /bin/sh, spawned as a child of the proxy). */
-  startCommand?: string;
-  /** Shell command that stops the engine (run via /bin/sh). */
-  stopCommand?: string;
+  /**
+   * Lifecycle mode A (mutually exclusive with `commands`): a single shell
+   * command that starts the engine. The proxy spawns it, holds a process
+   * handle on it, and stops it by killing the whole process group (SIGTERM,
+   * then SIGKILL after `childKillGraceMs`). If the child dies on its own, the
+   * next request restarts it.
+   */
+  command?: string;
+  /** Lifecycle mode B (mutually exclusive with `command`): separate start/stop shell commands. */
+  commands?: EngineCommands;
   /** Cooldown buffer after stopping, before starting the new engine. Overrides defaults. */
   coolDownMs?: number;
   /** Health/readiness endpoint path (relative to targetBaseUrl) that must return 200. */
@@ -97,7 +116,7 @@ export interface ModelConfig {
   vramThresholdPct?: number;
   /**
    * `false` = the engine runs on *another* host (or is fully externally managed):
-   * the proxy never runs `startCommand`/`stopCommand` locally, spawns no child,
+   * the proxy never runs its start/stop commands locally, spawns no child,
    * skips the local VRAM gate, and only polls the health endpoint before
    * forwarding. Default: `true` (engine lives on the proxy host).
    */
@@ -344,14 +363,28 @@ function assertSchema(raw: unknown, fileName: string): void {
   if (validateSchema(raw)) return;
   const problems = (validateSchema.errors ?? []).map((e: ErrorObject) => {
     const path = e.instancePath || "(root)";
-    // ajv's default enum message is generic; spell out the allowed values.
+    // ajv's default messages are generic for these keywords; spell them out.
     const extra =
       e.keyword === "enum"
         ? ` (expected one of: ${(e.params as { allowedValues?: unknown[] }).allowedValues?.join(", ")})`
-        : "";
+        : e.keyword === "not" && path.startsWith("/models/")
+          ? " (command and commands are mutually exclusive — use one or the other)"
+          : "";
     return `${path}: ${e.message ?? "invalid value"}${extra}`;
   });
   throw new ConfigError(`${fileName}: invalid config — ${problems.join("; ")}`);
+}
+
+/**
+ * The lifecycle mode a model declares (mirrors EngineManager's engineKind):
+ * how the shared engine of its provider is driven locally. `managed: false`
+ * always means "no local lifecycle" (any declared commands are ignored).
+ */
+function modelLifecycleKind(m: ModelConfig): "command" | "commands" | "none" {
+  if (m.managed === false) return "none";
+  if (typeof m.command === "string") return "command";
+  if (m.commands) return "commands";
+  return "none";
 }
 
 /**
@@ -381,6 +414,22 @@ function finalize(raw: unknown): InfermuxConfig {
   for (const [alias, entry] of Object.entries(r.models ?? {})) {
     // The schema guarantees the exact shape; the spread widens it to unknown.
     models[alias] = { ...entry } as unknown as ModelConfig;
+  }
+
+  // Models sharing a provider share one engine instance, so they must agree on
+  // how it is driven: a mixed setup (e.g. one alias with `command`, another
+  // with `commands` or none) would leave the engine un-restartable through
+  // some aliases once it dies. Enforce one lifecycle mode per provider.
+  const kindByProvider = new Map<string, { kind: string; alias: string }>();
+  for (const [alias, m] of Object.entries(models)) {
+    const kind = modelLifecycleKind(m);
+    const prev = kindByProvider.get(m.provider);
+    if (prev && prev.kind !== kind) {
+      throw new ConfigError(
+        `models "${prev.alias}" and "${alias}" both use provider "${m.provider}" but declare different lifecycles (${prev.kind} vs ${kind}); models sharing a provider share one engine and must use the same lifecycle mode (command, commands, or neither)`,
+      );
+    }
+    if (!prev) kindByProvider.set(m.provider, { kind, alias });
   }
 
   return { server, defaults, models };

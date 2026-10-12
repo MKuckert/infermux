@@ -51,11 +51,11 @@ const config = {
   models: {
     llama: {
       provider: "ollama", targetBaseUrl: `http://127.0.0.1:${pPort}`, targetModel: "llama3:latest",
-      startCommand: `node -e "setInterval(()=>{},1e3)"`, stopCommand: "true", healthEndpoint: "/health",
+      command: `node -e "setInterval(()=>{},1e3)"`, healthEndpoint: "/health",
     },
     mistral: {
       provider: "vllm", targetBaseUrl: `http://127.0.0.1:${pPort}`, targetModel: "Mistral-7B",
-      startCommand: `node -e "setInterval(()=>{},1e3)"`, stopCommand: "true", healthEndpoint: "/health",
+      command: `node -e "setInterval(()=>{},1e3)"`, healthEndpoint: "/health",
     },
   },
 };

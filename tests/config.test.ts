@@ -137,6 +137,28 @@ describe("validateConfig", () => {
     ).toThrow(/INFERMUX_UNSET_KEY_XYZ/);
   });
 
+  it("rejects a model that sets both command and commands", () => {
+    expect(() =>
+      validateConfig({
+        models: { m: { provider: "p", targetBaseUrl: "http://x", command: "a", commands: { start: "s", stop: "t" } } },
+      }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it("parses command and commands lifecycle modes", () => {
+    const cfg = validateConfig({
+      ...base,
+      models: {
+        a: { provider: "p", targetBaseUrl: "http://x", command: "ollama serve" },
+        b: { provider: "q", targetBaseUrl: "http://y", commands: { start: "nohup serve &", stop: "pkill -f serve" } },
+      },
+    });
+    expect(cfg.models.a!.command).toBe("ollama serve");
+    expect(cfg.models.a!.commands).toBeUndefined();
+    expect(cfg.models.b!.commands).toEqual({ start: "nohup serve &", stop: "pkill -f serve" });
+    expect(cfg.models.b!.command).toBeUndefined();
+  });
+
   it("rejects non-string targetHeaders values", () => {
     expect(() =>
       validateConfig({
@@ -144,6 +166,57 @@ describe("validateConfig", () => {
         models: { m: { provider: "p", targetBaseUrl: "http://x", targetHeaders: { "x": 5 } } as never },
       }),
     ).toThrow(/targetHeaders/);
+  });
+
+  it("rejects mixed lifecycle modes across aliases of the same provider", () => {
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: {
+          a: { provider: "p", targetBaseUrl: "http://x", command: "serve" },
+          b: { provider: "p", targetBaseUrl: "http://x", commands: { start: "s", stop: "t" } },
+        },
+      }),
+    ).toThrow(/different lifecycles/);
+    // command vs no lifecycle
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: {
+          a: { provider: "p", targetBaseUrl: "http://x", command: "serve" },
+          b: { provider: "p", targetBaseUrl: "http://x" },
+        },
+      }),
+    ).toThrow(/different lifecycles/);
+    // same mode is fine (incl. both without a lifecycle)
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: {
+          a: { provider: "p", targetBaseUrl: "http://x", command: "serve" },
+          b: { provider: "p", targetBaseUrl: "http://x", command: "serve" },
+        },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: {
+          a: { provider: "p", targetBaseUrl: "http://x" },
+          b: { provider: "p", targetBaseUrl: "http://x" },
+        },
+      }),
+    ).not.toThrow();
+    // managed:false counts as "no local lifecycle" even with commands declared
+    expect(() =>
+      validateConfig({
+        ...base,
+        models: {
+          a: { provider: "p", targetBaseUrl: "http://x", managed: false, commands: { start: "s", stop: "t" } },
+          b: { provider: "p", targetBaseUrl: "http://x" },
+        },
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -159,13 +232,13 @@ describe("${ENV} expansion across the whole config", () => {
       ...base,
       server: { host: "${IMX_HOST}", port: 1 },
       models: {
-        m: { provider: "p", targetBaseUrl: "http://127.0.0.1:${IMX_PORT}", startCommand: "ollama serve ${IMX_HOST}" },
+        m: { provider: "p", targetBaseUrl: "http://127.0.0.1:${IMX_PORT}", command: "ollama serve ${IMX_HOST}" },
       },
     });
     expect(cfg.server.host).toBe("10.0.0.5");
     // nested inside a larger string: plain text substitution
     expect(cfg.models.m!.targetBaseUrl).toBe("http://127.0.0.1:9123");
-    expect(cfg.models.m!.startCommand).toBe("ollama serve 10.0.0.5");
+    expect(cfg.models.m!.command).toBe("ollama serve 10.0.0.5");
     delete process.env.IMX_HOST;
     delete process.env.IMX_PORT;
   });
@@ -175,9 +248,9 @@ describe("${ENV} expansion across the whole config", () => {
     process.env.IMX_B = "b";
     const cfg = validateConfig({
       ...base,
-      models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "run ${IMX_A} and ${IMX_B}" } },
+      models: { m: { provider: "p", targetBaseUrl: "http://x", commands: { start: "run ${IMX_A} and ${IMX_B}", stop: "stop" } } },
     });
-    expect(cfg.models.m!.startCommand).toBe("run a and b");
+    expect(cfg.models.m!.commands?.start).toBe("run a and b");
     // no references -> unchanged
     expect(cfg.models.m!.targetBaseUrl).toBe("http://x");
     delete process.env.IMX_A;
@@ -259,7 +332,7 @@ describe("${ENV} expansion across the whole config", () => {
 
   it("fails on an unclosed ${ reference (typo detection)", () => {
     expect(() =>
-      validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "ollama serve ${IMX_HOST" } } }),
+      validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", command: "ollama serve ${IMX_HOST" } } }),
     ).toThrow(/unclosed/);
     // also when the whole value is a malformed reference
     expect(() =>
@@ -268,8 +341,8 @@ describe("${ENV} expansion across the whole config", () => {
   });
 
   it("leaves closed-but-non-reference forms (shell syntax) untouched", () => {
-    const cfg = validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "run ${SHELL_VAR:-default}" } } });
-    expect(cfg.models.m!.startCommand).toBe("run ${SHELL_VAR:-default}");
+    const cfg = validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", command: "run ${SHELL_VAR:-default}" } } });
+    expect(cfg.models.m!.command).toBe("run ${SHELL_VAR:-default}");
   });
 
   it("rejects keys that expand to the same name (collision)", () => {
@@ -286,8 +359,8 @@ describe("${ENV} expansion across the whole config", () => {
   it("does not re-expand ${...} sequences inside env var values", () => {
     process.env.IMX_OUTER = "run ${IMX_INNER}";
     try {
-      const cfg = validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", startCommand: "${IMX_OUTER}" } } });
-      expect(cfg.models.m!.startCommand).toBe("run ${IMX_INNER}");
+      const cfg = validateConfig({ ...base, models: { m: { provider: "p", targetBaseUrl: "http://x", command: "${IMX_OUTER}" } } });
+      expect(cfg.models.m!.command).toBe("run ${IMX_INNER}");
     } finally {
       delete process.env.IMX_OUTER;
     }
@@ -323,6 +396,24 @@ describe("config.schema.json (direct ajv — anti-drift)", () => {
     expect(
       validate({ models: { m: { provider: "p", targetBaseUrl: "http://x", healthEndpoint: "h" } } }),
     ).toBe(false);
+  });
+
+  it("rejects a model that sets both command and commands", () => {
+    expect(
+      validate({
+        models: { m: { provider: "p", targetBaseUrl: "http://x", command: "a", commands: { start: "s", stop: "t" } } },
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects commands without a stop (and accepts command-only and commands-only models)", () => {
+    expect(
+      validate({ models: { m: { provider: "p", targetBaseUrl: "http://x", commands: { start: "s" } } } }),
+    ).toBe(false);
+    expect(validate({ models: { m: { provider: "p", targetBaseUrl: "http://x", command: "a" } } })).toBe(true);
+    expect(
+      validate({ models: { m: { provider: "p", targetBaseUrl: "http://x", commands: { start: "s", stop: "t" } } } }),
+    ).toBe(true);
   });
 });
 

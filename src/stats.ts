@@ -66,7 +66,7 @@ export class Stats {
         provider: eng.provider,
         modelAlias: eng.modelAlias,
         pid: eng.pid,
-        running: eng.childAlive,
+        running: eng.running,
         totalSwitches: eng.switches,
       },
       queue: {

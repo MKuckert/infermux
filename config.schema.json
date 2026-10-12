@@ -80,7 +80,7 @@
         "stopCommandTimeoutMs": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "Max time to wait for a shell stopCommand, in ms. Default 10000."
+          "description": "Max time to wait for a shell stop command (commands.stop), in ms. Default 10000."
         }
       }
     },
@@ -92,6 +92,9 @@
         "type": "object",
         "required": ["provider", "targetBaseUrl"],
         "additionalProperties": false,
+        "not": {
+          "required": ["command", "commands"]
+        },
         "properties": {
           "provider": {
             "type": "string",
@@ -108,13 +111,28 @@
             "minLength": 1,
             "description": "Model id expected by the provider; the request's model field is rewritten to this."
           },
-          "startCommand": {
+          "command": {
             "type": "string",
-            "description": "Shell command that starts the engine (spawned by the proxy)."
+            "minLength": 1,
+            "description": "Single shell command that starts the engine; the proxy holds a process handle and stops it by killing its whole process group (SIGTERM, then SIGKILL). Mutually exclusive with commands."
           },
-          "stopCommand": {
-            "type": "string",
-            "description": "Shell command that stops the engine."
+          "commands": {
+            "type": "object",
+            "required": ["start", "stop"],
+            "additionalProperties": false,
+            "properties": {
+              "start": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Shell command that starts the engine (fire-and-forget; it may launch another server process — the proxy holds no handle on it)."
+              },
+              "stop": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Shell command that stops the engine."
+              }
+            },
+            "description": "Separate start/stop shell commands; the proxy holds no process handle and only tracks whether the engine was started. Mutually exclusive with command."
           },
           "coolDownMs": {
             "type": "number",

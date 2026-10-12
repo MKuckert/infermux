@@ -16,11 +16,33 @@ export class EngineError extends Error {
   }
 }
 
+/**
+ * How the active engine is driven locally:
+ * - `"command"`: a single spawned child the proxy holds a process handle on
+ *   (stopped by killing its whole process group).
+ * - `"commands"`: separate start/stop shell commands; the proxy holds no
+ *   process handle and only tracks whether the engine was started (stopped by
+ *   running the stop command).
+ */
+export type EngineKind = "command" | "commands";
+
+/** Local lifecycle kind for a model config (null = no local process management). */
+export function engineKind(cfg: ModelConfig): EngineKind | null {
+  if (cfg.managed === false) return null;
+  if (typeof cfg.command === "string") return "command";
+  if (cfg.commands) return "commands";
+  // Neither `command` nor `commands`: externally managed — the proxy only
+  // health-checks and forwards.
+  return null;
+}
+
 export interface EngineState {
   provider: string | null;
   modelAlias: string | null;
+  /** pid of the spawned child process (`command` mode only; null otherwise). */
   pid: number | null;
-  childAlive: boolean;
+  /** true while the active engine process is running. */
+  running: boolean;
   /** Monotonic counter incremented on every stop/start transition. */
   switches: number;
 }
@@ -37,15 +59,19 @@ export interface EngineState {
 export class EngineManager {
   activeProvider: string | null = null;
   activeModelAlias: string | null = null;
+  /** How the active engine is driven (null = none / remote / externally managed). */
+  private kind: EngineKind | null = null;
+  /** Handle of the spawned child (`command` mode only). */
   private child: ChildProcess | null = null;
+  /** `command` mode: the spawned child is alive. */
   private childAlive = false;
-  /** True once we have spawned a child for the active engine (false when the engine is externally managed). */
-  private childSpawned = false;
+  /** `commands` mode: the start command was fired and stop has not run yet. */
+  private started = false;
   private switches = 0;
   private lock: Promise<unknown> = Promise.resolve();
   /** Config of the last *successful* start; used to restore the previous engine after a failed transition. */
   private activeCfg: ModelConfig | null = null;
-  /** Stop command paired with the active engine (null when externally managed). */
+  /** Stop command paired with the active engine (`commands` mode only). */
   private stopCommandForActive: string | null = null;
   /** Latches on shutdown; subsequent ensureReady/transition calls fail fast. */
   private shuttingDown = false;
@@ -56,12 +82,19 @@ export class EngineManager {
     private log: EngineLog = () => {},
   ) {}
 
+  /** true while the active engine process is running. */
+  get running(): boolean {
+    if (this.kind === "command") return this.childAlive;
+    if (this.kind === "commands") return this.started;
+    return false;
+  }
+
   state(): EngineState {
     return {
       provider: this.activeProvider,
       modelAlias: this.activeModelAlias,
       pid: this.child?.pid ?? null,
-      childAlive: this.childAlive,
+      running: this.running,
       switches: this.switches,
     };
   }
@@ -79,20 +112,27 @@ export class EngineManager {
   async ensureReady(alias: string, cfg: ModelConfig): Promise<void> {
     if (this.shuttingDown) throw new EngineError("infermux is shutting down");
     if (this.activeProvider === cfg.provider) {
-      // If the engine we spawned died on its own, bring it back (only for
-      // engines we actually manage on this host).
-      if (cfg.managed !== false && this.childSpawned && !this.childAlive && cfg.startCommand) {
-        this.log(`engine: ${cfg.provider} child not running; restarting`);
+      // If the active engine is not running anymore, bring it back (only for
+      // locally managed engines whose kind matches the requested config).
+      const kind = engineKind(cfg);
+      if (kind !== null && this.kind === kind && !this.running) {
+        this.log(`engine: ${cfg.provider} not running; restarting`);
         await this.withLock(async () => {
           // Re-check under the lock: a concurrent transition may have changed
           // the active provider or already restarted the engine.
-          if (
-            this.activeProvider === cfg.provider &&
-            cfg.managed !== false &&
-            !this.childAlive &&
-            cfg.startCommand
-          ) {
-            await this.startActive(alias, cfg);
+          if (this.activeProvider === cfg.provider && this.kind === kind && !this.running) {
+            try {
+              await this.startActive(alias, cfg);
+            } catch (err) {
+              // A failed restart must not leave a half-started engine behind
+              // (it would keep holding VRAM, and in `commands` mode the stale
+              // started flag would block any retry). Tear it down and keep the
+              // kind paired so the next request retries cleanly.
+              await this.stopActive();
+              this.kind = kind;
+              this.started = false;
+              throw err;
+            }
           }
         });
       }
@@ -117,13 +157,14 @@ export class EngineManager {
     const fromAlias = this.activeModelAlias;
     const fromCfg = this.activeCfg;
     const fromStopCmd = this.stopCommandForActive;
+    const fromKind = this.kind;
     this.log(`engine: preparing switch ${from ?? "(none)"} -> ${cfg.provider} (model "${alias}")`);
-    const remote = cfg.managed === false;
+    const remote = engineKind(cfg) === null;
     try {
       await this.stopActive();
       if (remote) {
         // The engine runs on another host: no local cool-down, no local VRAM
-        // gate, no startCommand — just verify it is reachable/healthy.
+        // gate, no start command — just verify it is reachable/healthy.
         this.log(`engine: ${cfg.provider} is remote/externally managed; skipping local lifecycle steps`);
       } else {
         const coolDown = cfg.coolDownMs ?? d.coolDownMs;
@@ -144,12 +185,12 @@ export class EngineManager {
       this.activeCfg = cfg;
       this.switches++;
     } catch (err) {
-      // The new engine half-started: reap its child so it doesn't keep
-      // holding VRAM while we roll back to the previous engine.
-      await this.killChild();
+      // The new engine half-started: tear it down so it doesn't keep holding
+      // VRAM while we roll back to the previous engine.
+      await this.stopActive();
       // Best effort: restore the previously active engine so it stays usable.
       let restored = false;
-      if (from !== null && fromCfg?.startCommand) {
+      if (from !== null && fromCfg && engineKind(fromCfg) !== null) {
         this.log(`engine: new engine failed; restoring previous "${from}" engine`);
         try {
           await this.startActive(fromAlias ?? "", fromCfg);
@@ -162,33 +203,49 @@ export class EngineManager {
       if (!restored) {
         // Roll back the active pointer so we don't claim a half-started engine.
         // (The alias goes back to the *previous* alias, not the failed one.)
+        // The previous engine was already stopped and its restore failed, so
+        // mark it not running: the next request for it re-runs its start.
         this.activeProvider = from;
         this.activeModelAlias = fromAlias;
         this.activeCfg = fromCfg;
+        this.kind = fromKind;
         this.stopCommandForActive = fromStopCmd;
+        this.started = false;
       }
       throw err;
     }
   }
 
-  /** Stop the currently active engine (stopCommand + child signal). */
+  /**
+   * Stop the currently active engine per its lifecycle kind:
+   * - `commands`: run the paired stop command (only if we actually started
+   *   something — tracked in `started`; there is no process handle to kill).
+   * - `command`: kill the child's whole process group.
+   */
   private async stopActive(): Promise<void> {
     if (!this.activeProvider) return;
-    if (this.stopCommandForActive) {
-      this.log(`engine: running stopCommand: ${this.stopCommandForActive}`);
-      try {
-        await withTimeout(
-          execAsync(this.stopCommandForActive),
-          this.defaults.stopCommandTimeoutMs,
-          "stopCommand",
-        );
-      } catch (err) {
-        this.log(`engine: stopCommand failed (continuing): ${errMsg(err)}`);
+    if (this.kind === "commands") {
+      if (this.started && this.stopCommandForActive) {
+        this.log(`engine: running stop command: ${this.stopCommandForActive}`);
+        try {
+          await withTimeout(
+            execAsync(this.stopCommandForActive),
+            this.defaults.stopCommandTimeoutMs,
+            "stop command",
+          );
+        } catch (err) {
+          this.log(`engine: stop command failed (continuing): ${errMsg(err)}`);
+        }
+      } else if (!this.started) {
+        this.log("engine: no stop command run — engine was not started");
       }
+      this.started = false;
+    } else if (this.kind === "command") {
+      await this.killChild();
     }
-    await this.killChild();
-    // The active engine is gone; clear its stop command so it can't run again
-    // against a *different* provider that later becomes active.
+    // The active engine is gone; clear its kind/stop command so they can't run
+    // again against a *different* provider that later becomes active.
+    this.kind = null;
     this.stopCommandForActive = null;
   }
 
@@ -220,7 +277,6 @@ export class EngineManager {
   private async killChild(): Promise<void> {
     const child = this.child;
     this.child = null;
-    this.childSpawned = false;
     if (!child || child.pid === undefined) {
       this.childAlive = false;
       return;
@@ -252,10 +308,13 @@ export class EngineManager {
   }
 
   private async startActive(alias: string, cfg: ModelConfig): Promise<void> {
-    if (cfg.managed === false) {
+    const kind = engineKind(cfg);
+    if (kind === null) {
       // Never run start/stop commands against a remote engine from the proxy
       // host; it must also not poison the stop pairing.
+      this.kind = null;
       this.stopCommandForActive = null;
+      this.started = false;
       this.activeProvider = cfg.provider;
       this.activeModelAlias = alias;
       if (cfg.healthEndpoint) {
@@ -265,16 +324,15 @@ export class EngineManager {
       this.log(`engine: ${cfg.provider} is ready for model "${alias}" (remote)`);
       return;
     }
-    if (cfg.startCommand) {
-      this.log(`engine: starting ${cfg.provider} via: ${cfg.startCommand}`);
-      const child = spawn(cfg.startCommand, {
+    if (kind === "command") {
+      this.log(`engine: starting ${cfg.provider} via command: ${cfg.command}`);
+      const child = spawn(cfg.command!, {
         shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
       this.child = child;
       this.childAlive = true;
-      this.childSpawned = true;
       // Scope the handlers to *this* child: a stale exit event from a
       // previous child must not clobber the state of a newly spawned one.
       child.on("exit", (code, signal) => {
@@ -289,12 +347,29 @@ export class EngineManager {
         this.log(`engine: child error: ${err.message}`);
       });
       pipeToLog(child, cfg.provider, this.log);
+    } else {
+      // `commands` mode: fire the start command without holding a process
+      // handle — it may launch another server process that only `stop` can
+      // stop. The launcher is unref'd so it cannot keep the proxy alive; its
+      // output is piped to the log while it runs. Readiness is established by
+      // the health poll below, not by the launcher's exit.
+      this.log(`engine: starting ${cfg.provider} via commands.start: ${cfg.commands!.start}`);
+      const launcher = spawn(cfg.commands!.start, {
+        shell: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+      });
+      launcher.on("error", (err) => this.log(`engine: start command error: ${err.message}`));
+      pipeToLog(launcher, cfg.provider, this.log);
+      launcher.unref();
+      this.started = true;
     }
     // Pair the stop command with the engine we are about to activate. This is
     // done unconditionally (even for externally-managed engines, which have no
-    // startCommand) so a leftover stop command from a previous provider can't
+    // start command) so a leftover stop command from a previous provider can't
     // leak into a later stop of a different provider.
-    this.stopCommandForActive = cfg.stopCommand ?? null;
+    this.kind = kind;
+    this.stopCommandForActive = kind === "commands" ? cfg.commands!.stop : null;
     this.activeProvider = cfg.provider;
     this.activeModelAlias = alias;
     const healthUrl = cfg.healthEndpoint
@@ -303,9 +378,9 @@ export class EngineManager {
     if (healthUrl) {
       this.log(`engine: polling health at ${healthUrl}`);
       await this.waitForHealth(cfg);
-    } else if (cfg.startCommand) {
-      // No health endpoint: give the engine a moment to bind its port, then probe
-      // the base URL itself.
+    } else {
+      // No health endpoint: give the engine a moment to bind its port, then
+      // probe the base URL itself.
       await this.probeBaseReady(cfg);
     }
     this.log(`engine: ${cfg.provider} is ready for model "${alias}"`);
@@ -376,36 +451,23 @@ export class EngineManager {
     }
   }
 
-  /** Graceful shutdown: stop the active engine and kill the child. */
+  /** Graceful shutdown: stop the active engine (stop command / process-group kill). */
   async shutdown(): Promise<void> {
     await this.withLock(async () => {
       // Latch first so transitions queued behind us fail instead of
       // re-spawning an engine right after we tore it down.
       this.shuttingDown = true;
-      if (!this.activeProvider) {
+      if (this.activeProvider) {
+        await this.stopActive();
+      } else {
+        // No active engine, but reap a stray child if one exists.
         await this.killChild();
-        this.stopCommandForActive = null;
-        this.childSpawned = false;
-        this.activeCfg = null;
-        this.log("engine: shutdown complete");
-        return;
       }
-      if (this.stopCommandForActive) {
-        this.log(`engine: shutdown — running stopCommand: ${this.stopCommandForActive}`);
-        try {
-          await withTimeout(
-            execAsync(this.stopCommandForActive),
-            this.defaults.stopCommandTimeoutMs,
-            "stopCommand",
-          );
-        } catch (err) {
-          this.log(`engine: shutdown stopCommand failed (continuing): ${errMsg(err)}`);
-        }
-      }
-      await this.killChild();
       this.activeProvider = null;
       this.activeModelAlias = null;
+      this.kind = null;
       this.stopCommandForActive = null;
+      this.started = false;
       this.activeCfg = null;
       this.log("engine: shutdown complete");
     });
